@@ -58,7 +58,7 @@ Velum runs an in-memory Yjs CRDT room manager over persistent WebSockets (`ws`),
    git push origin main
    ```
 2. Go to [dashboard.render.com](https://dashboard.render.com) and click **New +** -> **Blueprint**.
-3. Select your repository: `dharshanprogrammer/Real-time-collaborative-document-editor`.
+3. Select your repository: `dharshanprogrammer/velum-collaborative-editor`.
 4. Render will detect [render.yaml](file:///d:/Projects/Full%20Stack%20Lab%20Project/render.yaml).
 5. When prompted for environment variables:
    - `MONGODB_URI`: Paste your MongoDB Atlas connection string from Step 1.
@@ -93,7 +93,7 @@ Velum runs an in-memory Yjs CRDT room manager over persistent WebSockets (`ws`),
 ## Step 3: Deploy Frontend to Vercel
 
 1. Go to [vercel.com/new](https://vercel.com/new) and log in with GitHub.
-2. Select and import `dharshanprogrammer/Real-time-collaborative-document-editor`.
+2. Select and import `dharshanprogrammer/velum-collaborative-editor`.
 3. In the **Configure Project** screen:
    - **Project Name**: `velum` (or custom name)
    - **Framework Preset**: `Vite`

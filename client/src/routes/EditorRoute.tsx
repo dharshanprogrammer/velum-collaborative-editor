@@ -92,9 +92,37 @@ export function EditorRoute() {
       .catch(() => {});
   };
 
+  // Cross-Tab Title Synchronization
+  useEffect(() => {
+    if (!id) return;
+    let channel: BroadcastChannel | null = null;
+    try {
+      if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+        channel = new BroadcastChannel(`velum_doc_title_${id}`);
+        channel.onmessage = (event) => {
+          if (event.data?.title && event.data.title !== title) {
+            setTitle(event.data.title);
+          }
+        };
+      }
+    } catch (_) {}
+
+    return () => {
+      channel?.close();
+    };
+  }, [id, title]);
+
   const handleTitleChange = async (newTitle: string) => {
     setTitle(newTitle);
     if (!id) return;
+    try {
+      if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+        const channel = new BroadcastChannel(`velum_doc_title_${id}`);
+        channel.postMessage({ title: newTitle });
+        channel.close();
+      }
+    } catch (_) {}
+
     try {
       await api.patch(`/documents/${id}`, { title: newTitle });
       toast.success('Title saved');

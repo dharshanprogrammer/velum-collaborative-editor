@@ -103,6 +103,9 @@ export function CowriteEditor({
     if (initialIcon !== undefined) setDocIcon(initialIcon);
   }, [initialIcon]);
 
+  const tabIdRef = useRef(`tab_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`);
+  const applyRemoteContentRef = useRef<(content: string) => void>(() => {});
+
   const handleCoverChange = async (newCover: string | null) => {
     setCoverId(newCover);
     if (newCover) {
@@ -110,6 +113,21 @@ export function CowriteEditor({
     } else {
       localStorage.removeItem(`velum_cover_${docId}`);
     }
+
+    try {
+      if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+        const channel = new BroadcastChannel(`velum_doc_channel_${docId}`);
+        channel.postMessage({ type: 'DOC_COVER_UPDATE', coverId: newCover, tabId: tabIdRef.current });
+        channel.close();
+      }
+    } catch (_) {}
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({ type: 'DOC_META_UPDATE', coverId: newCover, tabId: tabIdRef.current })
+      );
+    }
+
     try {
       await api.patch(`/documents/${docId}`, { coverId: newCover });
     } catch (_) {}
@@ -118,6 +136,21 @@ export function CowriteEditor({
   const handleIconChange = async (newIcon: string) => {
     setDocIcon(newIcon);
     localStorage.setItem(`velum_icon_${docId}`, newIcon);
+
+    try {
+      if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+        const channel = new BroadcastChannel(`velum_doc_channel_${docId}`);
+        channel.postMessage({ type: 'DOC_ICON_UPDATE', icon: newIcon, tabId: tabIdRef.current });
+        channel.close();
+      }
+    } catch (_) {}
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({ type: 'DOC_META_UPDATE', icon: newIcon, tabId: tabIdRef.current })
+      );
+    }
+
     try {
       await api.patch(`/documents/${docId}`, { icon: newIcon });
     } catch (_) {}
@@ -135,18 +168,32 @@ export function CowriteEditor({
     // 1. Immediately persist locally (0ms durability)
     localStorage.setItem(`velum_content_${docId}`, htmlContent);
 
-    // 2. Broadcast to real-time peers over WebSocket
+    // 2. Broadcast immediately to other tabs in the same browser (0ms intra-browser)
+    try {
+      if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+        const channel = new BroadcastChannel(`velum_doc_channel_${docId}`);
+        channel.postMessage({
+          type: 'DOC_CONTENT_UPDATE',
+          content: htmlContent,
+          tabId: tabIdRef.current,
+        });
+        channel.close();
+      }
+    } catch (_) {}
+
+    // 3. Broadcast to real-time peers over WebSocket
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(
         JSON.stringify({
           type: 'DOC_CONTENT_UPDATE',
           content: htmlContent,
           senderId: currentUser?.id,
+          tabId: tabIdRef.current,
         })
       );
     }
 
-    // 3. Debounced cloud persist to MongoDB
+    // 4. Debounced cloud persist to MongoDB
     onStatusChange('saving');
     if (autoSaveTimerRef.current) {
       clearTimeout(autoSaveTimerRef.current);
@@ -211,6 +258,56 @@ export function CowriteEditor({
       }
     },
   });
+
+  const applyRemoteContent = (newContent: string) => {
+    if (!editor || newContent === undefined || newContent === null) return;
+    const currentHtml = editor.getHTML();
+    if (currentHtml === newContent) return;
+
+    const { from, to } = editor.state.selection;
+    editor.commands.setContent(newContent, false);
+    try {
+      const docSize = editor.state.doc.content.size;
+      if (from <= docSize && to <= docSize) {
+        editor.commands.setTextSelection({ from, to });
+      }
+    } catch (_) {}
+
+    localStorage.setItem(`velum_content_${docId}`, newContent);
+    onStatusChange('saved');
+  };
+
+  useEffect(() => {
+    applyRemoteContentRef.current = applyRemoteContent;
+  });
+
+  // Cross-Tab Instant Synchronization (0ms intra-browser via BroadcastChannel)
+  useEffect(() => {
+    let channel: BroadcastChannel | null = null;
+    try {
+      if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+        channel = new BroadcastChannel(`velum_doc_channel_${docId}`);
+        channel.onmessage = (event) => {
+          const data = event.data;
+          if (!data || data.tabId === tabIdRef.current) return;
+
+          if (data.type === 'DOC_CONTENT_UPDATE' && data.content !== undefined) {
+            applyRemoteContentRef.current(data.content);
+          } else if (data.type === 'DOC_COVER_UPDATE') {
+            setCoverId(data.coverId);
+          } else if (data.type === 'DOC_ICON_UPDATE') {
+            setDocIcon(data.icon);
+          }
+        };
+      }
+    } catch (err) {
+      console.warn('[BroadcastChannel Warning]:', err);
+    }
+
+    return () => {
+      channel?.close();
+    };
+  }, [docId, editor]);
 
   // When initialContent arrives asynchronously, populate if editor is clean
   useEffect(() => {
@@ -288,8 +385,22 @@ export function CowriteEditor({
 
       ws.onmessage = (event) => {
         try {
+          let json: any = null;
           if (typeof event.data === 'string') {
-            const json = JSON.parse(event.data);
+            try {
+              json = JSON.parse(event.data);
+            } catch (_) {}
+          } else if (event.data instanceof ArrayBuffer) {
+            try {
+              const text = new TextDecoder().decode(event.data);
+              const trimmed = text.trim();
+              if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+                json = JSON.parse(trimmed);
+              }
+            } catch (_) {}
+          }
+
+          if (json) {
             if (json.type === 'PEER_JOINED' && json.user) {
               studioSound.playJoinChime();
               setPeers((prev) => {
@@ -308,13 +419,14 @@ export function CowriteEditor({
                 onPeersChange(Array.from(updated.values()));
                 return updated;
               });
-            } else if (json.type === 'DOC_CONTENT_UPDATE' && json.senderId !== currentUser?.id) {
-              // Remote peer edited content
-              if (editor && json.content) {
-                const isFocused = editor.isFocused;
-                if (!isFocused) {
-                  editor.commands.setContent(json.content, false);
-                }
+            } else if (json.type === 'DOC_CONTENT_UPDATE') {
+              if (json.tabId !== tabIdRef.current && json.content !== undefined) {
+                applyRemoteContentRef.current(json.content);
+              }
+            } else if (json.type === 'DOC_META_UPDATE') {
+              if (json.tabId !== tabIdRef.current) {
+                if (json.coverId !== undefined) setCoverId(json.coverId);
+                if (json.icon !== undefined) setDocIcon(json.icon);
               }
             } else if (json.type === 'ROLE_CHANGED' && json.newRole) {
               if (editor) {

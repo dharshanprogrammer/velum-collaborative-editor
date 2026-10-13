@@ -123,8 +123,9 @@ export function setupWebSocketServer(httpServer: HttpServer) {
         // Check if JSON message (control plane)
         try {
           const text = new TextDecoder().decode(uint8Array);
-          if (text.startsWith('{') && text.endsWith('}')) {
-            const parsed = JSON.parse(text);
+          const trimmed = text.trim();
+          if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+            const parsed = JSON.parse(trimmed);
             handleControlMessage(room, ws, parsed);
             return;
           }
@@ -228,6 +229,14 @@ function handleControlMessage(room: Room, ws: WebSocket, msg: any) {
     broadcastToRoom(room, ws, 'DOC_CONTENT_UPDATE', {
       content: msg.content,
       senderId: msg.senderId,
+      tabId: msg.tabId,
+    });
+  } else if (msg.type === 'DOC_META_UPDATE') {
+    broadcastToRoom(room, ws, 'DOC_META_UPDATE', {
+      title: msg.title,
+      icon: msg.icon,
+      coverId: msg.coverId,
+      tabId: msg.tabId,
     });
   } else if (msg.type === 'UPDATE_ROLE' && msg.targetUserId && msg.newRole) {
     // Notify target user of live permission change

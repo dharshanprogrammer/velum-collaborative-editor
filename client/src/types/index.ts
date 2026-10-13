@@ -31,12 +31,15 @@ export interface DocumentItem {
 
 export interface CollaboratorPeer {
   id: string;
+  tabId?: string;
   name: string;
   email: string;
   colorIndex: number;
   cursor?: {
-    anchor: number;
-    head: number;
+    anchor?: number;
+    head?: number;
+    x?: number;
+    y?: number;
   };
   selection?: {
     from: number;

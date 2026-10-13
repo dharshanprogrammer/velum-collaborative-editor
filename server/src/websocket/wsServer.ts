@@ -105,6 +105,16 @@ export function setupWebSocketServer(httpServer: HttpServer) {
     // Send role notification
     sendJson(ws, 'ROLE_INFO', { role, docId });
 
+    // Send currently active peers in this room to the newly connected client
+    const existingPeers = Array.from(room.conns.values()).map((c) => ({
+      id: c.user.id,
+      name: c.user.name,
+      email: c.user.email,
+      colorIndex: c.user.colorIndex,
+      role: c.role,
+    }));
+    sendJson(ws, 'ROOM_PEERS', { peers: existingPeers });
+
     // Broadcast join event to all other peers
     broadcastToRoom(room, ws, 'PEER_JOINED', {
       user: {
@@ -237,6 +247,10 @@ function handleControlMessage(room: Room, ws: WebSocket, msg: any) {
       icon: msg.icon,
       coverId: msg.coverId,
       tabId: msg.tabId,
+    });
+  } else if (msg.type === 'CURSOR_UPDATE' && msg.peer) {
+    broadcastToRoom(room, ws, 'CURSOR_UPDATE', {
+      peer: msg.peer,
     });
   } else if (msg.type === 'UPDATE_ROLE' && msg.targetUserId && msg.newRole) {
     // Notify target user of live permission change

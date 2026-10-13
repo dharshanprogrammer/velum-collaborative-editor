@@ -30,7 +30,8 @@ import { SyncStatus } from './StatusPill';
 import { CollaboratorPeer, UserProfile } from '../../types';
 import { studioSound, SoundProfile } from '../../lib/sound';
 import { api } from '../../lib/api';
-import { cn } from '../../lib/utils';
+import { cn, getCollabColor } from '../../lib/utils';
+import { motion } from 'framer-motion';
 import { toast } from 'sonner';
 
 
@@ -213,6 +214,86 @@ export function CowriteEditor({
     }, 600);
   };
 
+  const lastCursorSendRef = useRef<number>(0);
+
+  const updatePeersState = (updater: (prev: Map<string, CollaboratorPeer>) => Map<string, CollaboratorPeer>) => {
+    setPeers((prev) => {
+      const next = updater(prev);
+      const peersList = Array.from(next.values());
+      const allUsers = [
+        ...(currentUser ? [{
+          id: currentUser.id,
+          tabId: tabIdRef.current,
+          name: `${currentUser.name} (You)`,
+          email: currentUser.email,
+          colorIndex: currentUser.colorIndex,
+          lastActive: Date.now(),
+        }] : []),
+        ...peersList.filter((p) => p.tabId !== tabIdRef.current),
+      ];
+      onPeersChange(allUsers);
+      return next;
+    });
+  };
+
+  // Sync initial user presence on mount
+  useEffect(() => {
+    if (currentUser) {
+      onPeersChange([{
+        id: currentUser.id,
+        tabId: tabIdRef.current,
+        name: `${currentUser.name} (You)`,
+        email: currentUser.email,
+        colorIndex: currentUser.colorIndex,
+        lastActive: Date.now(),
+      }]);
+    }
+  }, [currentUser]);
+
+  const broadcastCursor = (cursorData: { x: number; y: number; isTyping?: boolean }) => {
+    if (!currentUser) return;
+    const now = Date.now();
+    if (now - lastCursorSendRef.current < 25) return;
+    lastCursorSendRef.current = now;
+
+    const peerInfo: CollaboratorPeer = {
+      id: currentUser.id,
+      tabId: tabIdRef.current,
+      name: currentUser.name,
+      email: currentUser.email,
+      colorIndex: currentUser.colorIndex,
+      cursor: {
+        x: Math.round(cursorData.x),
+        y: Math.round(cursorData.y),
+      },
+      isTyping: !!cursorData.isTyping,
+      lastActive: now,
+    };
+
+    // Broadcast to other tabs in this browser (0ms)
+    try {
+      if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+        const channel = new BroadcastChannel(`velum_doc_channel_${docId}`);
+        channel.postMessage({
+          type: 'CURSOR_UPDATE',
+          peer: peerInfo,
+          tabId: tabIdRef.current,
+        });
+        channel.close();
+      }
+    } catch (_) {}
+
+    // Broadcast over WebSocket to all remote peers
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'CURSOR_UPDATE',
+          peer: peerInfo,
+        })
+      );
+    }
+  };
+
   // Initialize TipTap Editor
   const editor = useEditor({
     extensions: [
@@ -259,6 +340,30 @@ export function CowriteEditor({
     },
   });
 
+  // Track user caret selection in editor to broadcast live cursor
+  useEffect(() => {
+    if (!editor) return;
+
+    const handleSelectionUpdate = () => {
+      if (!editorContainerRef.current) return;
+      try {
+        const head = editor.state.selection.head;
+        const coords = editor.view.coordsAtPos(head);
+        const rect = editorContainerRef.current.getBoundingClientRect();
+        const x = coords.left - rect.left;
+        const y = coords.top - rect.top;
+        if (x >= 0 && y >= 0) {
+          broadcastCursor({ x, y, isTyping: true });
+        }
+      } catch (_) {}
+    };
+
+    editor.on('selectionUpdate', handleSelectionUpdate);
+    return () => {
+      editor.off('selectionUpdate', handleSelectionUpdate);
+    };
+  }, [editor, currentUser]);
+
   const applyRemoteContent = (newContent: string) => {
     if (!editor || newContent === undefined || newContent === null) return;
     const currentHtml = editor.getHTML();
@@ -287,6 +392,16 @@ export function CowriteEditor({
     try {
       if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
         channel = new BroadcastChannel(`velum_doc_channel_${docId}`);
+
+        // Greet other tabs so they immediately discover this tab
+        if (currentUser) {
+          channel.postMessage({
+            type: 'PEER_HELLO',
+            tabId: tabIdRef.current,
+            user: currentUser,
+          });
+        }
+
         channel.onmessage = (event) => {
           const data = event.data;
           if (!data || data.tabId === tabIdRef.current) return;
@@ -297,6 +412,49 @@ export function CowriteEditor({
             setCoverId(data.coverId);
           } else if (data.type === 'DOC_ICON_UPDATE') {
             setDocIcon(data.icon);
+          } else if (data.type === 'CURSOR_UPDATE' && data.peer) {
+            updatePeersState((prev) => {
+              const next = new Map(prev);
+              const key = data.peer.tabId || data.peer.id;
+              next.set(key, { ...data.peer, lastActive: Date.now() });
+              return next;
+            });
+          } else if (data.type === 'PEER_HELLO' && data.user) {
+            if (currentUser) {
+              const reply = new BroadcastChannel(`velum_doc_channel_${docId}`);
+              reply.postMessage({
+                type: 'PEER_HELLO_REPLY',
+                tabId: tabIdRef.current,
+                user: currentUser,
+              });
+              reply.close();
+            }
+
+            updatePeersState((prev) => {
+              const next = new Map(prev);
+              next.set(data.tabId, {
+                id: data.user.id,
+                tabId: data.tabId,
+                name: data.user.name,
+                email: data.user.email,
+                colorIndex: data.user.colorIndex,
+                lastActive: Date.now(),
+              });
+              return next;
+            });
+          } else if (data.type === 'PEER_HELLO_REPLY' && data.user) {
+            updatePeersState((prev) => {
+              const next = new Map(prev);
+              next.set(data.tabId, {
+                id: data.user.id,
+                tabId: data.tabId,
+                name: data.user.name,
+                email: data.user.email,
+                colorIndex: data.user.colorIndex,
+                lastActive: Date.now(),
+              });
+              return next;
+            });
           }
         };
       }
@@ -307,7 +465,7 @@ export function CowriteEditor({
     return () => {
       channel?.close();
     };
-  }, [docId, editor]);
+  }, [docId, editor, currentUser]);
 
   // When initialContent arrives asynchronously, populate if editor is clean
   useEffect(() => {
@@ -401,24 +559,46 @@ export function CowriteEditor({
           }
 
           if (json) {
-            if (json.type === 'PEER_JOINED' && json.user) {
-              studioSound.playJoinChime();
-              setPeers((prev) => {
-                const updated = new Map(prev);
-                updated.set(json.user.id, {
-                  ...json.user,
-                  lastActive: Date.now(),
+            if (json.type === 'ROOM_PEERS' && Array.isArray(json.peers)) {
+              updatePeersState((prev) => {
+                const next = new Map(prev);
+                json.peers.forEach((p: any) => {
+                  if (p.id !== currentUser?.id) {
+                    next.set(p.id, {
+                      ...p,
+                      lastActive: Date.now(),
+                    });
+                  }
                 });
-                onPeersChange(Array.from(updated.values()));
-                return updated;
+                return next;
+              });
+            } else if (json.type === 'PEER_JOINED' && json.user) {
+              studioSound.playJoinChime();
+              updatePeersState((prev) => {
+                const next = new Map(prev);
+                if (json.user.id !== currentUser?.id) {
+                  next.set(json.user.id, {
+                    ...json.user,
+                    lastActive: Date.now(),
+                  });
+                }
+                return next;
               });
             } else if (json.type === 'PEER_LEFT' && json.userId) {
-              setPeers((prev) => {
-                const updated = new Map(prev);
-                updated.delete(json.userId);
-                onPeersChange(Array.from(updated.values()));
-                return updated;
+              updatePeersState((prev) => {
+                const next = new Map(prev);
+                next.delete(json.userId);
+                return next;
               });
+            } else if (json.type === 'CURSOR_UPDATE' && json.peer) {
+              if (json.peer.tabId !== tabIdRef.current) {
+                updatePeersState((prev) => {
+                  const next = new Map(prev);
+                  const key = json.peer.tabId || json.peer.id;
+                  next.set(key, { ...json.peer, lastActive: Date.now() });
+                  return next;
+                });
+              }
             } else if (json.type === 'DOC_CONTENT_UPDATE') {
               if (json.tabId !== tabIdRef.current && json.content !== undefined) {
                 applyRemoteContentRef.current(json.content);
@@ -600,6 +780,13 @@ export function CowriteEditor({
       >
         <div
           ref={editorContainerRef}
+          onMouseMove={(e) => {
+            if (!editorContainerRef.current) return;
+            const rect = editorContainerRef.current.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            broadcastCursor({ x, y });
+          }}
           className={cn(
             'w-full bg-surface/90 backdrop-blur-md rounded-3xl p-8 sm:p-14 shadow-floating border border-border/80 transition-all duration-300 relative min-h-[750px]',
             wideMode ? 'max-w-5xl' : 'max-w-[830px]',
@@ -609,6 +796,60 @@ export function CowriteEditor({
         >
           {/* Subtle decorative editorial accent */}
           <div className="absolute top-0 inset-x-12 h-1 bg-gradient-to-r from-transparent via-accent/30 to-transparent rounded-full" />
+
+          {/* Real-time Collaborative Cursors Overlay */}
+          {Array.from(peers.values()).map((peer) => {
+            if (!peer.cursor?.x || !peer.cursor?.y || peer.tabId === tabIdRef.current) return null;
+            if (Date.now() - (peer.lastActive || 0) > 12000) return null;
+            const color = getCollabColor(peer.colorIndex);
+
+            return (
+              <motion.div
+                key={peer.tabId || peer.id}
+                initial={false}
+                animate={{
+                  x: peer.cursor.x,
+                  y: peer.cursor.y,
+                  opacity: 1,
+                }}
+                transition={{
+                  type: 'spring',
+                  damping: 30,
+                  stiffness: 450,
+                  mass: 0.15,
+                }}
+                className="absolute top-0 left-0 pointer-events-none z-30 flex flex-col items-start select-none"
+              >
+                {/* Precision SVG Cursor Pointer */}
+                <svg
+                  width="18"
+                  height="18"
+                  viewBox="0 0 16 16"
+                  fill="none"
+                  className="drop-shadow-md -mt-0.5 -ml-0.5"
+                >
+                  <path
+                    d="M1 1L6 14L9 9L14 6L1 1Z"
+                    fill={color}
+                    stroke="#ffffff"
+                    strokeWidth="1.5"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+
+                {/* Floating Name Badge */}
+                <div
+                  className="px-2 py-0.5 rounded-full text-[10px] font-bold text-white shadow-lg flex items-center gap-1.5 -mt-1 ml-3 whitespace-nowrap ring-1 ring-black/10"
+                  style={{ backgroundColor: color }}
+                >
+                  <span>{peer.name}</span>
+                  {peer.isTyping && (
+                    <span className="w-1.5 h-1.5 rounded-full bg-white animate-ping" />
+                  )}
+                </div>
+              </motion.div>
+            );
+          })}
 
           {/* Artistic Document Cover Artwork & Emoji Badge */}
           <DocumentCover
